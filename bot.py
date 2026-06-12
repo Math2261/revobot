@@ -128,19 +128,29 @@ def barra_progresso(segundos: int, meta: int = REQUIRED_SECONDS, tamanho: int = 
     pct = int(progresso * 100)
     return f"`{barra}` {pct}%"
 
+def horario_brasilia() -> str:
+    from datetime import timedelta
+    brasilia = datetime.now(timezone.utc) - timedelta(hours=3)
+    return brasilia.strftime("%H:%M:%S")
+
 def build_painel_embed() -> discord.Embed:
     agora = datetime.now(timezone.utc)
 
+    # ── Sem evento ──────────────────────────────────────────────────────────
     if not evento_ativo and not participantes:
         embed = discord.Embed(
-            title="🎬 CineRevo 2026 — Painel de Presença",
-            description="Nenhum evento em andamento.",
+            title="🎬  CineRevo 2026 — Painel de Presença",
+            description=(
+                "\n"
+                "Nenhum evento em andamento no momento.\n"
+                "Aguardando início...\n"
+            ),
             color=COR_ENCERRADO
         )
-        embed.set_footer(text="Aguardando início do evento...")
+        embed.set_footer(text=f"🕐 {horario_brasilia()} (Brasília)")
         return embed
 
-    # Snapshot com tempo atual
+    # ── Snapshot ─────────────────────────────────────────────────────────────
     snapshot = []
     for uid, d in participantes.items():
         total = tempo_atual(uid)
@@ -150,53 +160,113 @@ def build_painel_embed() -> discord.Embed:
             "na_call": d["entrou_em"] is not None,
             "ganhou": total >= REQUIRED_SECONDS
         })
-
     snapshot.sort(key=lambda x: x["total_seconds"], reverse=True)
 
-    com_emblema = sum(1 for s in snapshot if s["ganhou"])
+    com_emblema   = sum(1 for s in snapshot if s["ganhou"])
     na_call_agora = sum(1 for s in snapshot if s["na_call"])
     total_pessoas = len(snapshot)
+    LIMITE_EXPANDIDO = 8  # até 8 pessoas → layout expandido; acima → compacto
 
-    status_str = "🟢 **Em andamento**" if evento_ativo else "🔴 **Encerrado**"
+    # ── Header ───────────────────────────────────────────────────────────────
+    if evento_ativo:
+        status_icon  = "🟢"
+        status_label = "Em andamento"
+        cor          = COR_ATIVO
+    else:
+        status_icon  = "🔴"
+        status_label = "Encerrado"
+        cor          = COR_ENCERRADO
 
     embed = discord.Embed(
-        title="🎬 CineRevo 2026 — Painel de Presença",
-        color=COR_ATIVO if evento_ativo else COR_ENCERRADO
+        title="🎬  CineRevo 2026 — Painel de Presença",
+        color=cor
     )
 
+    # ── Estatísticas (linha de resumo) ───────────────────────────────────────
     embed.add_field(
-        name="📡 Status",
-        value=status_str,
+        name="Status",
+        value=f"{status_icon}  {status_label}",
         inline=True
     )
     embed.add_field(
-        name="🎙️ Na call agora",
-        value=f"**{na_call_agora}** pessoas",
+        name="🎙️  Na call agora",
+        value=f"**{na_call_agora}**",
         inline=True
     )
     embed.add_field(
-        name="✅ Com emblema",
+        name="🏅  Ganharam Emblema",
         value=f"**{com_emblema}** / {total_pessoas}",
         inline=True
     )
 
-    if snapshot:
-        linhas = []
-        for i, s in enumerate(snapshot[:20]):  # máx 20 no painel
-            icone = "🎟️" if s["ganhou"] else ("🎙️" if s["na_call"] else "⏸️")
-            tempo_fmt = formatar_tempo(s["total_seconds"])
-            linhas.append(f"{icone} **{s['nick']}** — {tempo_fmt}")
+    # ── Separador visual ─────────────────────────────────────────────────────
+    embed.add_field(name="\u200b", value="─" * 36, inline=False)
 
-        if len(snapshot) > 20:
-            linhas.append(f"*...e mais {len(snapshot) - 20} participantes*")
+    # ── Lista de participantes — EXPANDIDO (≤ 8 pessoas) ────────────────────
+    if snapshot and total_pessoas <= LIMITE_EXPANDIDO:
+        for s in snapshot:
+            if s["ganhou"]:
+                icone  = "🏅"
+                estado = "Ganhou o Emblema!"
+            elif s["na_call"]:
+                icone  = "🎙️"
+                estado = "Na call agora"
+            else:
+                icone  = "⏸️"
+                estado = "Fora da call"
+
+            h = s["total_seconds"] // 3600
+            m = (s["total_seconds"] % 3600) // 60
+            tempo_fmt = f"{h}h {m:02d}min"
+
+            # Barra de progresso
+            prog  = min(s["total_seconds"] / REQUIRED_SECONDS, 1.0)
+            cheios = int(prog * 8)
+            barra = "█" * cheios + "░" * (8 - cheios)
+            pct   = int(prog * 100)
+
+            embed.add_field(
+                name=f"{icone}  {s['nick']}",
+                value=f"`{barra}` {pct}%  •  **{tempo_fmt}**\n{estado}",
+                inline=True
+            )
+
+        # Padding para alinhar grid de 2 colunas se número ímpar
+        if total_pessoas % 2 != 0:
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+    # ── Lista de participantes — COMPACTO (> 8 pessoas) ──────────────────────
+    elif snapshot:
+        MAX_COMPACTO = 25
+        linhas = []
+        for s in snapshot[:MAX_COMPACTO]:
+            if s["ganhou"]:
+                icone = "🏅"
+            elif s["na_call"]:
+                icone = "🎙️"
+            else:
+                icone = "⏸️"
+            h = s["total_seconds"] // 3600
+            m = (s["total_seconds"] % 3600) // 60
+            linhas.append(f"{icone} **{s['nick']}** — {h}h {m:02d}min")
+
+        if total_pessoas > MAX_COMPACTO:
+            linhas.append(f"*...e mais {total_pessoas - MAX_COMPACTO} participantes*")
 
         embed.add_field(
-            name=f"👥 Participantes ({total_pessoas})",
+            name=f"👥  Participantes ({total_pessoas})",
             value="\n".join(linhas),
             inline=False
         )
 
-    embed.set_footer(text=f"🔄 Atualizado às {agora.strftime('%H:%M:%S')} UTC  •  Ícones: 🎟️ Emblema garantido  |  🎙️ Na call  |  ⏸️ Saiu")
+    # ── Legenda ──────────────────────────────────────────────────────────────
+    embed.add_field(
+        name="\u200b",
+        value="🏅 Ganhou o Emblema  ·  🎙️ Na call  ·  ⏸️ Saiu",
+        inline=False
+    )
+
+    embed.set_footer(text=f"🔄 Atualizado às {horario_brasilia()} (Brasília)")
     return embed
 
 
@@ -274,8 +344,24 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         if member.id not in dm_enviadas:
             dm_enviadas.add(member.id)
             try:
-                mensagem = carregar_dm_mensagem()
-                await member.send(mensagem)
+                texto_extra = carregar_dm_mensagem()
+                dm_embed = discord.Embed(
+                    title="🎬  Bem-vindo ao CineRevo 2026!",
+                    description=texto_extra,
+                    color=0xF5C518
+                )
+                dm_embed.add_field(
+                    name="⏱️  Meta de tempo",
+                    value="Fique **1 hora** na call para ganhar o emblema.",
+                    inline=False
+                )
+                dm_embed.add_field(
+                    name="🔄  Tempo acumulado",
+                    value="Pode sair e voltar! O tempo é somado automaticamente.",
+                    inline=False
+                )
+                dm_embed.set_footer(text="CineRevo 2026  •  Boa sessão! 🍿")
+                await member.send(embed=dm_embed)
             except discord.Forbidden:
                 pass  # Usuário com DMs fechadas, ignora silenciosamente
 
@@ -456,28 +542,38 @@ async def resetar_evento(interaction: discord.Interaction):
     await atualizar_painel()
 
 
-@tree.command(name="definir_mensagem", description="Define a mensagem DM enviada quando alguém entra na call")
-@app_commands.describe(mensagem="Texto da DM. Use \\n para quebra de linha.")
+@tree.command(name="definir_mensagem", description="Define o texto principal da DM de boas-vindas do evento")
+@app_commands.describe(mensagem="Texto que aparece no corpo da DM. Use \\n para quebrar linha.")
 async def definir_mensagem(interaction: discord.Interaction, mensagem: str):
     if not tem_cargo_admin(interaction):
         embed = discord.Embed(description="❌ Você não tem permissão.", color=COR_ERRO)
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    # Suporta \n literal como quebra de linha
     texto = mensagem.replace("\\n", "\n")
     salvar_dm_mensagem(texto)
 
-    embed = discord.Embed(
-        title="✅ Mensagem DM atualizada!",
+    # Mostra prévia real do embed que será enviado
+    preview = discord.Embed(
+        title="🎬  Bem-vindo ao CineRevo 2026!",
+        description=texto,
+        color=0xF5C518
+    )
+    preview.add_field(name="⏱️  Meta de tempo", value="Fique **1 hora** na call para ganhar o emblema.", inline=False)
+    preview.add_field(name="🔄  Tempo acumulado", value="Pode sair e voltar! O tempo é somado automaticamente.", inline=False)
+    preview.set_footer(text="CineRevo 2026  •  Boa sessão! 🍿")
+
+    confirmacao = discord.Embed(
+        title="✅  Mensagem atualizada!",
+        description="Prévia de como vai aparecer na DM:",
         color=COR_SUCESSO
     )
-    embed.add_field(name="📨 Prévia", value=texto[:1000], inline=False)
-    embed.set_footer(text=f"Alterado por {interaction.user.display_name}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    confirmacao.set_footer(text=f"Alterado por {interaction.user.display_name}")
+
+    await interaction.response.send_message(embeds=[confirmacao, preview], ephemeral=True)
 
 
-@tree.command(name="ver_mensagem", description="Mostra a mensagem DM atual que é enviada aos participantes")
+@tree.command(name="ver_mensagem", description="Mostra a prévia da DM atual que será enviada aos participantes")
 async def ver_mensagem(interaction: discord.Interaction):
     if not tem_cargo_admin(interaction):
         embed = discord.Embed(description="❌ Você não tem permissão.", color=COR_ERRO)
@@ -485,13 +581,24 @@ async def ver_mensagem(interaction: discord.Interaction):
         return
 
     texto = carregar_dm_mensagem()
-    embed = discord.Embed(
-        title="📨 Mensagem DM atual",
-        description=texto[:2000],
+
+    preview = discord.Embed(
+        title="🎬  Bem-vindo ao CineRevo 2026!",
+        description=texto,
+        color=0xF5C518
+    )
+    preview.add_field(name="⏱️  Meta de tempo", value="Fique **1 hora** na call para ganhar o emblema.", inline=False)
+    preview.add_field(name="🔄  Tempo acumulado", value="Pode sair e voltar! O tempo é somado automaticamente.", inline=False)
+    preview.set_footer(text="CineRevo 2026  •  Boa sessão! 🍿")
+
+    header = discord.Embed(
+        title="📨  Prévia da DM atual",
+        description="É assim que a mensagem aparece para quem entrar na call:",
         color=COR_ATIVO
     )
-    embed.set_footer(text="Use /definir_mensagem para alterar")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    header.set_footer(text="Use /definir_mensagem para alterar o texto")
+
+    await interaction.response.send_message(embeds=[header, preview], ephemeral=True)
 
 
 # ─── RUN ──────────────────────────────────────────────────────────────────────
