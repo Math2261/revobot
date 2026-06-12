@@ -69,8 +69,10 @@ def formatar_tempo(segundos: int) -> str:
 @bot.event
 async def on_ready():
     carregar_dados()
-    await tree.sync()
-    print(f"✅ Bot online como {bot.user} | Evento ativo: {evento_ativo}")
+    guild = discord.Object(id=715701837650460712)
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
+    print(f"✅ Bot online como {bot.user} | Evento ativo: {evento_ativo} | Comandos sincronizados!")
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
