@@ -6,13 +6,17 @@ import csv
 import os
 import asyncio
 from datetime import datetime, timezone
-from io import StringIO
+from io import StringIO, BytesIO
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-VOICE_CHANNEL_ID = 1400622934468329612
-ADMIN_ROLE_ID    = 717157700315774976
-REQUIRED_SECONDS = 3600  # 1 hora
-DATA_FILE        = "data.json"
+VOICE_CHANNEL_ID  = 1400622934468329612
+ADMIN_ROLE_ID     = 717157700315774976
+PAINEL_CHANNEL_ID = 798186632389197835
+GUILD_ID          = 715701837650460712
+REQUIRED_SECONDS  = 3600  # 1 hora
+DATA_FILE         = "data.json"
+PAINEL_FILE       = "painel_msg_id.txt"
+INTERVALO_PAINEL  = 30  # segundos
 # ──────────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -25,8 +29,16 @@ tree = bot.tree
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
 evento_ativo = False
-# { user_id: { "nick": str, "discord_tag": str, "total_seconds": int, "entrou_em": datetime | None } }
+evento_inicio: datetime | None = None
 participantes: dict = {}
+painel_message_id: int | None = None
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── CORES / TEMA ─────────────────────────────────────────────────────────────
+COR_ATIVO    = 0xF5C518  # dourado IMDb
+COR_ENCERRADO = 0x2C2F33  # cinza escuro
+COR_SUCESSO  = 0x2ECC71  # verde
+COR_ERRO     = 0xE74C3C  # vermelho
 # ──────────────────────────────────────────────────────────────────────────────
 
 def salvar_dados():
@@ -55,6 +67,19 @@ def carregar_dados():
             "entrou_em": datetime.fromisoformat(d["entrou_em"]) if d["entrou_em"] else None
         }
 
+def salvar_painel_id(msg_id: int):
+    with open(PAINEL_FILE, "w") as f:
+        f.write(str(msg_id))
+
+def carregar_painel_id() -> int | None:
+    if not os.path.exists(PAINEL_FILE):
+        return None
+    with open(PAINEL_FILE, "r") as f:
+        try:
+            return int(f.read().strip())
+        except:
+            return None
+
 def tem_cargo_admin(interaction: discord.Interaction) -> bool:
     return any(r.id == ADMIN_ROLE_ID for r in interaction.user.roles)
 
@@ -64,29 +89,151 @@ def formatar_tempo(segundos: int) -> str:
     s = segundos % 60
     return f"{h}h {m:02d}min {s:02d}s"
 
+def tempo_atual(uid: int) -> int:
+    d = participantes.get(uid)
+    if not d:
+        return 0
+    total = d["total_seconds"]
+    if d["entrou_em"]:
+        total += int((datetime.now(timezone.utc) - d["entrou_em"]).total_seconds())
+    return total
+
+def barra_progresso(segundos: int, meta: int = REQUIRED_SECONDS, tamanho: int = 10) -> str:
+    progresso = min(segundos / meta, 1.0)
+    cheios = int(progresso * tamanho)
+    vazios = tamanho - cheios
+    barra = "█" * cheios + "░" * vazios
+    pct = int(progresso * 100)
+    return f"`{barra}` {pct}%"
+
+def build_painel_embed() -> discord.Embed:
+    agora = datetime.now(timezone.utc)
+
+    if not evento_ativo and not participantes:
+        embed = discord.Embed(
+            title="🎬 CineRevo 2026 — Painel de Presença",
+            description="Nenhum evento em andamento.",
+            color=COR_ENCERRADO
+        )
+        embed.set_footer(text="Aguardando início do evento...")
+        return embed
+
+    # Snapshot com tempo atual
+    snapshot = []
+    for uid, d in participantes.items():
+        total = tempo_atual(uid)
+        snapshot.append({
+            "nick": d["nick"],
+            "total_seconds": total,
+            "na_call": d["entrou_em"] is not None,
+            "ganhou": total >= REQUIRED_SECONDS
+        })
+
+    snapshot.sort(key=lambda x: x["total_seconds"], reverse=True)
+
+    com_emblema = sum(1 for s in snapshot if s["ganhou"])
+    na_call_agora = sum(1 for s in snapshot if s["na_call"])
+    total_pessoas = len(snapshot)
+
+    status_str = "🟢 **Em andamento**" if evento_ativo else "🔴 **Encerrado**"
+
+    embed = discord.Embed(
+        title="🎬 CineRevo 2026 — Painel de Presença",
+        color=COR_ATIVO if evento_ativo else COR_ENCERRADO
+    )
+
+    embed.add_field(
+        name="📡 Status",
+        value=status_str,
+        inline=True
+    )
+    embed.add_field(
+        name="🎙️ Na call agora",
+        value=f"**{na_call_agora}** pessoas",
+        inline=True
+    )
+    embed.add_field(
+        name="✅ Com emblema",
+        value=f"**{com_emblema}** / {total_pessoas}",
+        inline=True
+    )
+
+    if snapshot:
+        linhas = []
+        for i, s in enumerate(snapshot[:20]):  # máx 20 no painel
+            icone = "🎟️" if s["ganhou"] else ("🎙️" if s["na_call"] else "⏸️")
+            tempo_fmt = formatar_tempo(s["total_seconds"])
+            linhas.append(f"{icone} **{s['nick']}** — {tempo_fmt}")
+
+        if len(snapshot) > 20:
+            linhas.append(f"*...e mais {len(snapshot) - 20} participantes*")
+
+        embed.add_field(
+            name=f"👥 Participantes ({total_pessoas})",
+            value="\n".join(linhas),
+            inline=False
+        )
+
+    embed.set_footer(text=f"🔄 Atualizado às {agora.strftime('%H:%M:%S')} UTC  •  Ícones: 🎟️ Emblema garantido  |  🎙️ Na call  |  ⏸️ Saiu")
+    return embed
+
+
+async def atualizar_painel():
+    global painel_message_id
+    canal = bot.get_channel(PAINEL_CHANNEL_ID)
+    if not canal:
+        return
+    embed = build_painel_embed()
+    if painel_message_id:
+        try:
+            msg = await canal.fetch_message(painel_message_id)
+            await msg.edit(embed=embed)
+            return
+        except discord.NotFound:
+            painel_message_id = None
+
+    # Cria nova mensagem se não existe
+    msg = await canal.send(embed=embed)
+    painel_message_id = msg.id
+    salvar_painel_id(msg.id)
+
+
+async def loop_painel():
+    await bot.wait_until_ready()
+    global painel_message_id
+    painel_message_id = carregar_painel_id()
+    while not bot.is_closed():
+        try:
+            await atualizar_painel()
+        except Exception as e:
+            print(f"[PAINEL ERROR] {e}")
+        await asyncio.sleep(INTERVALO_PAINEL)
+
+
 # ─── EVENTS ───────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
     carregar_dados()
-    guild = discord.Object(id=715701837650460712)
+    guild = discord.Object(id=GUILD_ID)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
-    print(f"✅ Bot online como {bot.user} | Evento ativo: {evento_ativo} | Comandos sincronizados!")
+    bot.loop.create_task(loop_painel())
+    print(f"✅ Bot online como {bot.user} | Comandos sincronizados!")
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    global participantes
-
     if not evento_ativo:
         return
 
-    # Entrou no canal do evento
     entrou = after.channel and after.channel.id == VOICE_CHANNEL_ID
-    saiu   = before.channel and before.channel.id == VOICE_CHANNEL_ID and (not after.channel or after.channel.id != VOICE_CHANNEL_ID)
+    saiu   = before.channel and before.channel.id == VOICE_CHANNEL_ID and (
+        not after.channel or after.channel.id != VOICE_CHANNEL_ID
+    )
+
+    agora = datetime.now(timezone.utc)
 
     if entrou:
-        agora = datetime.now(timezone.utc)
         if member.id not in participantes:
             participantes[member.id] = {
                 "nick": member.display_name,
@@ -95,7 +242,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 "entrou_em": agora
             }
         else:
-            # Atualiza nick caso tenha mudado
             participantes[member.id]["nick"] = member.display_name
             participantes[member.id]["discord_tag"] = str(member)
             participantes[member.id]["entrou_em"] = agora
@@ -103,36 +249,38 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
     elif saiu:
         if member.id in participantes and participantes[member.id]["entrou_em"]:
-            agora = datetime.now(timezone.utc)
             sessao = (agora - participantes[member.id]["entrou_em"]).total_seconds()
             participantes[member.id]["total_seconds"] += int(sessao)
             participantes[member.id]["entrou_em"] = None
             salvar_dados()
 
+
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
 
-@tree.command(name="iniciar_evento", description="Inicia o CineRevo 2026 e começa a contar o tempo dos participantes")
+@tree.command(name="iniciar_evento", description="Inicia o CineRevo 2026 (reseta dados anteriores)")
 async def iniciar_evento(interaction: discord.Interaction):
-    global evento_ativo, participantes
+    global evento_ativo, participantes, evento_inicio
 
     if not tem_cargo_admin(interaction):
-        await interaction.response.send_message("❌ Você não tem permissão.", ephemeral=True)
+        embed = discord.Embed(description="❌ Você não tem permissão.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     if evento_ativo:
-        await interaction.response.send_message("⚠️ O evento já está em andamento.", ephemeral=True)
+        embed = discord.Embed(description="⚠️ O evento já está em andamento.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     evento_ativo = True
+    evento_inicio = datetime.now(timezone.utc)
     participantes = {}
     salvar_dados()
 
-    # Registra quem já está na call no momento do início
-    guild = interaction.guild
-    canal = guild.get_channel(VOICE_CHANNEL_ID)
+    # Registra quem já está na call
+    canal_voz = interaction.guild.get_channel(VOICE_CHANNEL_ID)
     agora = datetime.now(timezone.utc)
-    if canal:
-        for member in canal.members:
+    if canal_voz:
+        for member in canal_voz.members:
             participantes[member.id] = {
                 "nick": member.display_name,
                 "discord_tag": str(member),
@@ -141,25 +289,35 @@ async def iniciar_evento(interaction: discord.Interaction):
             }
         salvar_dados()
 
-    await interaction.response.send_message("🎬 **CineRevo 2026 iniciado!** Contagem de tempo ativada.", ephemeral=True)
+    embed = discord.Embed(
+        title="🎬 CineRevo 2026 Iniciado!",
+        description="A contagem de tempo foi ativada.\nQuem ficar **1 hora** na call ganha o emblema!",
+        color=COR_SUCESSO
+    )
+    embed.add_field(name="🎙️ Já na call", value=f"**{len(participantes)}** pessoas", inline=True)
+    embed.set_footer(text=f"Iniciado por {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await atualizar_painel()
 
 
-@tree.command(name="encerrar_evento", description="Encerra o CineRevo 2026 e para a contagem de tempo")
+@tree.command(name="encerrar_evento", description="Encerra o CineRevo 2026 e preserva os dados para o relatório")
 async def encerrar_evento(interaction: discord.Interaction):
     global evento_ativo
 
     if not tem_cargo_admin(interaction):
-        await interaction.response.send_message("❌ Você não tem permissão.", ephemeral=True)
+        embed = discord.Embed(description="❌ Você não tem permissão.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     if not evento_ativo:
-        await interaction.response.send_message("⚠️ Nenhum evento em andamento.", ephemeral=True)
+        embed = discord.Embed(description="⚠️ Nenhum evento em andamento.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     evento_ativo = False
-
-    # Fecha sessões abertas de quem ainda está na call
     agora = datetime.now(timezone.utc)
+
+    # Fecha sessões abertas
     for uid, d in participantes.items():
         if d["entrou_em"]:
             sessao = (agora - d["entrou_em"]).total_seconds()
@@ -167,20 +325,33 @@ async def encerrar_evento(interaction: discord.Interaction):
             d["entrou_em"] = None
     salvar_dados()
 
-    await interaction.response.send_message("🛑 **CineRevo 2026 encerrado!** Use `/relatorio` para ver os resultados.", ephemeral=True)
+    com_emblema = sum(1 for d in participantes.values() if d["total_seconds"] >= REQUIRED_SECONDS)
+    total = len(participantes)
+
+    embed = discord.Embed(
+        title="🛑 CineRevo 2026 Encerrado!",
+        description="Contagem de tempo finalizada. Use `/relatorio` para ver o resultado completo.",
+        color=COR_ENCERRADO
+    )
+    embed.add_field(name="✅ Com emblema", value=f"**{com_emblema}**", inline=True)
+    embed.add_field(name="👥 Total", value=f"**{total}**", inline=True)
+    embed.set_footer(text=f"Encerrado por {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await atualizar_painel()
 
 
-@tree.command(name="relatorio", description="Gera o relatório CSV do CineRevo 2026")
+@tree.command(name="relatorio", description="Gera o relatório CSV completo do CineRevo 2026")
 async def relatorio(interaction: discord.Interaction):
     if not tem_cargo_admin(interaction):
-        await interaction.response.send_message("❌ Você não tem permissão.", ephemeral=True)
+        embed = discord.Embed(description="❌ Você não tem permissão.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     if not participantes:
-        await interaction.response.send_message("📭 Nenhum participante registrado ainda.", ephemeral=True)
+        embed = discord.Embed(description="📭 Nenhum participante registrado ainda.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    # Fecha sessões abertas se evento ainda ativo
     agora = datetime.now(timezone.utc)
     dados_snapshot = {}
     for uid, d in participantes.items():
@@ -193,49 +364,63 @@ async def relatorio(interaction: discord.Interaction):
             "total_seconds": total
         }
 
-    com_emblema    = [d for d in dados_snapshot.values() if d["total_seconds"] >= REQUIRED_SECONDS]
-    sem_emblema    = [d for d in dados_snapshot.values() if d["total_seconds"] < REQUIRED_SECONDS]
-    total_pessoas  = len(dados_snapshot)
+    com_emblema = [d for d in dados_snapshot.values() if d["total_seconds"] >= REQUIRED_SECONDS]
+    sem_emblema = [d for d in dados_snapshot.values() if d["total_seconds"] < REQUIRED_SECONDS]
 
-    # Gera CSV em memória
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow(["Nick do Servidor", "Discord", "Tempo Total", "Emblema"])
-
-    todos_ordenados = sorted(dados_snapshot.values(), key=lambda x: x["total_seconds"], reverse=True)
-    for d in todos_ordenados:
-        emblema = "✅" if d["total_seconds"] >= REQUIRED_SECONDS else "❌"
+    for d in sorted(dados_snapshot.values(), key=lambda x: x["total_seconds"], reverse=True):
+        emblema = "SIM" if d["total_seconds"] >= REQUIRED_SECONDS else "NAO"
         writer.writerow([d["nick"], d["discord_tag"], formatar_tempo(d["total_seconds"]), emblema])
 
     output.seek(0)
-    csv_bytes = output.getvalue().encode("utf-8-sig")  # utf-8-sig abre corretamente no Excel
+    csv_bytes = output.getvalue().encode("utf-8-sig")
+    arquivo = discord.File(fp=BytesIO(csv_bytes), filename="cinerevo2026_relatorio.csv")
 
-    arquivo = discord.File(fp=__import__("io").BytesIO(csv_bytes), filename="cinerevo2026_relatorio.csv")
-
-    resumo = (
-        f"📊 **CineRevo 2026 — Relatório**\n"
-        f"✅ Com emblema: **{len(com_emblema)}** pessoas\n"
-        f"❌ Sem emblema: **{len(sem_emblema)}** pessoas\n"
-        f"👥 Total na call: **{total_pessoas}** pessoas"
+    embed = discord.Embed(
+        title="📊 CineRevo 2026 — Relatório Final",
+        color=COR_ATIVO
     )
+    embed.add_field(name="✅ Com emblema", value=f"**{len(com_emblema)}** pessoas", inline=True)
+    embed.add_field(name="❌ Sem emblema", value=f"**{len(sem_emblema)}** pessoas", inline=True)
+    embed.add_field(name="👥 Total", value=f"**{len(dados_snapshot)}** pessoas", inline=True)
+    embed.set_footer(text="Arquivo CSV em anexo — abre no Excel ou Google Sheets")
 
-    await interaction.response.send_message(content=resumo, file=arquivo, ephemeral=True)
+    await interaction.response.send_message(embed=embed, file=arquivo, ephemeral=True)
 
 
-@tree.command(name="status_evento", description="Mostra se o evento está ativo e quantos participantes há")
+@tree.command(name="status_evento", description="Mostra o status atual do evento")
 async def status_evento(interaction: discord.Interaction):
     if not tem_cargo_admin(interaction):
-        await interaction.response.send_message("❌ Você não tem permissão.", ephemeral=True)
+        embed = discord.Embed(description="❌ Você não tem permissão.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    status = "🟢 **Ativo**" if evento_ativo else "🔴 **Encerrado**"
-    total  = len(participantes)
-    na_call = sum(1 for d in participantes.values() if d["entrou_em"] is not None)
+    embed = build_painel_embed()
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    await interaction.response.send_message(
-        f"📡 Status: {status}\n👥 Participantes registrados: **{total}**\n🎙️ Agora na call: **{na_call}**",
-        ephemeral=True
+
+@tree.command(name="resetar_evento", description="Reseta todos os dados sem encerrar o evento")
+async def resetar_evento(interaction: discord.Interaction):
+    global participantes
+
+    if not tem_cargo_admin(interaction):
+        embed = discord.Embed(description="❌ Você não tem permissão.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    participantes = {}
+    salvar_dados()
+
+    embed = discord.Embed(
+        title="🔄 Dados resetados!",
+        description="Todos os tempos e participantes foram apagados.",
+        color=COR_ERRO
     )
+    embed.set_footer(text=f"Resetado por {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await atualizar_painel()
 
 
 # ─── RUN ──────────────────────────────────────────────────────────────────────
