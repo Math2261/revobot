@@ -32,6 +32,28 @@ evento_ativo = False
 evento_inicio: datetime | None = None
 participantes: dict = {}
 painel_message_id: int | None = None
+dm_enviadas: set = set()  # IDs de quem já recebeu DM neste evento
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── MENSAGEM DM ──────────────────────────────────────────────────────────────
+DM_FILE = "dm_mensagem.txt"
+DM_PADRAO = (
+    "🎬 **Bem-vindo ao CineRevo 2026!**\n\n"
+    "Para ganhar o **Emblema CineRevo 2026**, você precisa ficar no mínimo "
+    "**1 hora** na call do evento.\n\n"
+    "O tempo é acumulado — pode sair e voltar! ⏱️\n\n"
+    "Bom evento! 🍿"
+)
+
+def carregar_dm_mensagem() -> str:
+    if not os.path.exists(DM_FILE):
+        return DM_PADRAO
+    with open(DM_FILE, "r", encoding="utf-8") as f:
+        return f.read().strip() or DM_PADRAO
+
+def salvar_dm_mensagem(texto: str):
+    with open(DM_FILE, "w", encoding="utf-8") as f:
+        f.write(texto)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ─── CORES / TEMA ─────────────────────────────────────────────────────────────
@@ -234,6 +256,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     agora = datetime.now(timezone.utc)
 
     if entrou:
+        primeira_vez = member.id not in participantes
         if member.id not in participantes:
             participantes[member.id] = {
                 "nick": member.display_name,
@@ -246,6 +269,15 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             participantes[member.id]["discord_tag"] = str(member)
             participantes[member.id]["entrou_em"] = agora
         salvar_dados()
+
+        # Envia DM apenas uma vez por evento
+        if member.id not in dm_enviadas:
+            dm_enviadas.add(member.id)
+            try:
+                mensagem = carregar_dm_mensagem()
+                await member.send(mensagem)
+            except discord.Forbidden:
+                pass  # Usuário com DMs fechadas, ignora silenciosamente
 
     elif saiu:
         if member.id in participantes and participantes[member.id]["entrou_em"]:
@@ -274,6 +306,7 @@ async def iniciar_evento(interaction: discord.Interaction):
     evento_ativo = True
     evento_inicio = datetime.now(timezone.utc)
     participantes = {}
+    dm_enviadas.clear()
     salvar_dados()
 
     # Registra quem já está na call
@@ -421,6 +454,44 @@ async def resetar_evento(interaction: discord.Interaction):
     embed.set_footer(text=f"Resetado por {interaction.user.display_name}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
     await atualizar_painel()
+
+
+@tree.command(name="definir_mensagem", description="Define a mensagem DM enviada quando alguém entra na call")
+@app_commands.describe(mensagem="Texto da DM. Use \\n para quebra de linha.")
+async def definir_mensagem(interaction: discord.Interaction, mensagem: str):
+    if not tem_cargo_admin(interaction):
+        embed = discord.Embed(description="❌ Você não tem permissão.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    # Suporta \n literal como quebra de linha
+    texto = mensagem.replace("\\n", "\n")
+    salvar_dm_mensagem(texto)
+
+    embed = discord.Embed(
+        title="✅ Mensagem DM atualizada!",
+        color=COR_SUCESSO
+    )
+    embed.add_field(name="📨 Prévia", value=texto[:1000], inline=False)
+    embed.set_footer(text=f"Alterado por {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="ver_mensagem", description="Mostra a mensagem DM atual que é enviada aos participantes")
+async def ver_mensagem(interaction: discord.Interaction):
+    if not tem_cargo_admin(interaction):
+        embed = discord.Embed(description="❌ Você não tem permissão.", color=COR_ERRO)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    texto = carregar_dm_mensagem()
+    embed = discord.Embed(
+        title="📨 Mensagem DM atual",
+        description=texto[:2000],
+        color=COR_ATIVO
+    )
+    embed.set_footer(text="Use /definir_mensagem para alterar")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ─── RUN ──────────────────────────────────────────────────────────────────────
